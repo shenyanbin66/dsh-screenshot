@@ -1,0 +1,40 @@
+{
+  "name": "dsh-screenshot",
+  "version": "0.1.0",
+  "description": "QQ 风格截图工具：DSH 内快捷键 Ctrl+Alt+A 或输入框旁按钮触发，冻结整屏拖拽选区，截图自动贴入当前会话输入框并复制到系统剪贴板（仅桌面版）。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "screenshot"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "runtime",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "author": "shenyanbin66",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-shortcuts"
+      ],
+      "platform": "web"
+    }
+  }
+}

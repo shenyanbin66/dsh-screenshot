@@ -1,0 +1,182 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>dsh-screenshot</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    overflow: hidden; background: #000;
+    cursor: crosshair;
+    user-select: none; -webkit-user-select: none;
+  }
+  #img {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block; image-rendering: auto;
+  }
+  /* 选区外变暗：巨幅 box-shadow 铺满整屏，选区内部保持原亮度 */
+  #sel {
+    position: absolute; display: none;
+    border: 1px solid #3b82f6;
+    box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+  }
+  #hint {
+    position: absolute; display: none;
+    font: 12px/16px "Segoe UI", system-ui, sans-serif;
+    color: #fff; background: rgba(0, 0, 0, 0.8);
+    padding: 2px 6px; border-radius: 3px;
+    pointer-events: none; white-space: nowrap; z-index: 2;
+  }
+</style>
+</head>
+<body>
+<img id="img" alt="">
+<div id="sel"></div>
+<div id="hint"></div>
+<script>
+'use strict'
+const { ipcRenderer } = require('electron')
+
+const imgEl = document.getElementById('img')
+const selEl = document.getElementById('sel')
+const hintEl = document.getElementById('hint')
+
+let ready = false
+let done = false
+let dragging = false
+let startX = 0
+let startY = 0
+let scaleX = 1
+let scaleY = 1
+let objectUrl = null
+
+ipcRenderer.on('shot:image', function (_event, payload) {
+  // JPEG Buffer → Blob URL（比 base64 dataURL：少 33% 膨胀 + decode 更快）
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null }
+  const bytes = payload.jpeg instanceof Uint8Array ? payload.jpeg : new Uint8Array(payload.jpeg)
+  objectUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }))
+  imgEl.onload = function () {
+    scaleX = imgEl.clientWidth > 0 ? imgEl.naturalWidth / imgEl.clientWidth : 1
+    scaleY = imgEl.clientHeight > 0 ? imgEl.naturalHeight / imgEl.clientHeight : 1
+    ready = true
+    // 等两帧确认像素真的画上去了，再通知主进程 show —— 零黑闪的关键
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        ipcRenderer.send('shot:ready')
+      })
+    })
+    // 冒烟测试：?autoshot=1 时自动框选一小块并完成，验证裁剪/剪贴板/bridge
+    var params = new URLSearchParams(location.search)
+    if (params.get('autoshot') === '1') {
+      setTimeout(function () {
+        if (done) return
+        startX = 40; startY = 40
+        finish({ x: 40, y: 40, w: 160, h: 120 })
+      }, 400)
+    }
+  }
+  imgEl.src = objectUrl
+})
+
+function normalized(x, y) {
+  return {
+    x: Math.min(startX, x),
+    y: Math.min(startY, y),
+    w: Math.abs(x - startX),
+    h: Math.abs(y - startY),
+  }
+}
+
+function paint(x, y) {
+  const r = normalized(x, y)
+  selEl.style.left = r.x + 'px'
+  selEl.style.top = r.y + 'px'
+  selEl.style.width = r.w + 'px'
+  selEl.style.height = r.h + 'px'
+  hintEl.textContent = Math.round(r.w) + ' × ' + Math.round(r.h)
+  const hintW = hintEl.offsetWidth || 60
+  const hintH = hintEl.offsetHeight || 20
+  let hx = r.x + r.w + 8
+  let hy = r.y + r.h + 8
+  if (hx + hintW > window.innerWidth - 4) hx = Math.max(4, r.x + r.w - hintW - 8)
+  if (hy + hintH > window.innerHeight - 4) hy = Math.max(4, r.y + r.h - hintH - 8)
+  hintEl.style.left = hx + 'px'
+  hintEl.style.top = hy + 'px'
+}
+
+document.addEventListener('mousedown', function (event) {
+  if (!ready || done || event.button !== 0) return
+  dragging = true
+  startX = event.clientX
+  startY = event.clientY
+  selEl.style.display = 'block'
+  hintEl.style.display = 'block'
+  paint(event.clientX, event.clientY)
+  event.preventDefault()
+})
+
+document.addEventListener('mousemove', function (event) {
+  if (!dragging || done) return
+  paint(event.clientX, event.clientY)
+})
+
+document.addEventListener('mouseup', function (event) {
+  if (!dragging || done || event.button !== 0) return
+  dragging = false
+  const r = normalized(event.clientX, event.clientY)
+  if (r.w < 4 || r.h < 4) {
+    cancel()
+    return
+  }
+  finish(r)
+})
+
+document.addEventListener('keydown', function (event) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    cancel()
+  }
+})
+
+document.addEventListener('contextmenu', function (event) {
+  event.preventDefault()
+  if (!done) cancel()
+})
+
+function finish(r) {
+  done = true
+  dragging = false
+  document.body.style.cursor = 'wait'
+  selEl.style.display = 'none'
+  hintEl.style.display = 'none'
+  const sx = Math.round(r.x * scaleX)
+  const sy = Math.round(r.y * scaleY)
+  const sw = Math.max(1, Math.round(r.w * scaleX))
+  const sh = Math.max(1, Math.round(r.h * scaleY))
+  try {
+    const canvas = document.createElement('canvas')
+    canvas.width = sw
+    canvas.height = sh
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('no 2d context')
+    context.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh)
+    const png = canvas.toDataURL('image/png')
+    if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null }
+    ipcRenderer.send('shot:done', { png: png })
+  } catch (error) {
+    ipcRenderer.send('shot:error', String((error && error.message) || error))
+  }
+}
+
+function cancel() {
+  if (done) return
+  done = true
+  dragging = false
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null }
+  ipcRenderer.send('shot:done', { cancelled: true })
+}
+</script>
+</body>
+</html>
