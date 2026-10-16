@@ -7,10 +7,18 @@
  *     每连接发一行 `cap`，本进程回一行 `dsh-screenshot-bridge:<json>` 后关闭。
  *     ⚠ 不能用 stdin 传命令：Electron GUI 子进程启动 ~2ms 内 Chromium 即关闭
  *     stdin 读端（探针实测 END/CLOSE，宿主写入 cb err=null 但数据静默丢弃）。
+ *   推送通道 = 连入宿主的 `\\.\pipe\dsh-screenshot-host`（宿主 apply 时 listen）：
+ *     **全局热键**触发的 capture 结果以一行 `dsh-screenshot-bridge:<json>` 推过去，
+ *     宿主经 `/screenshot/api/watch` 长轮询交给浏览器半插输入框。
  *   stdout = 只做启动公告与诊断：管道 listen 成功后发一行
  *     `dsh-screenshot-bridge:{"ok":true,"value":{"ready":true,"pipe":"\\\\.\\pipe\\..."}}`；
  *     Electron 还会先打一个空行，宿主忽略所有非 bridge 行。
- *   生命周期：闲置 10 分钟自退出；宿主杀进程/DSH 退出即整体退出。
+ *   全局热键 = app ready 即 `globalShortcut.register(默认 Ctrl+Shift+A)`，OS 级
+ *     捕获、绕开 DSH 全部输入闸门（设置面板/其他应用里也能截）；
+ *     `DSH_SCREENSHOT_HOTKEY` 可换键；注册失败每 2s 重试（重启窗口期旧孤儿
+ *     5s 内被父进程轮询清掉，或被别的应用占用）。
+ *   生命周期：热键在册 = 跟 DSH 同寿（父进程 ppid 每 5s 存活轮询，DSH 退→退出
+ *     释放热键）；热键没注册上才退回闲置 10 分钟自退出。
  *
  * 单次 capture 流程（延迟优化后的关键路径）：
  *   解析光标所在显示器 → **并行** [desktopCapturer JPEG 采集 ~640ms | 建窗加载 ~200ms]
@@ -31,6 +39,11 @@ const BRIDGE_PREFIX = 'dsh-screenshot-bridge:'
 const IDLE_MS = 10 * 60 * 1000
 const JPEG_QUALITY = 92
 const DEBUG_LOG = require('node:path').join(require('node:os').tmpdir(), 'dsh-screenshot-debug.log')
+const HOTKEY = process.env.DSH_SCREENSHOT_HOTKEY || 'CommandOrControl+Shift+A'
+const HOST_PIPE = '\\\\.\\pipe\\dsh-screenshot-host'
+const PARENT_PID = process.ppid
+const PARENT_POLL_MS = 5 * 1000
+const HOTKEY_RETRY_MS = 2 * 1000
 
 // 调试文件日志（定位"窗口没显示"/延迟问题）：%TEMP%\dsh-screenshot-debug.log
 function dbg(message) {
@@ -52,7 +65,7 @@ if (typeof electron !== 'object' || electron === null) {
   process.exit(1)
 }
 
-const { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, nativeImage, screen } = electron
+const { app, BrowserWindow, clipboard, desktopCapturer, globalShortcut, ipcMain, nativeImage, screen } = electron
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -76,13 +89,26 @@ function respond(message) {
 let ready = false
 let busy = false
 let idleTimer = null
+let hotkeyActive = false
+let hotkeyTries = 0
+let hostSock = null // 连入宿主 \\.\pipe\dsh-screenshot-host 的推送连接
+let hostConnectTimer = null
+const pushBuf = [] // 宿主推送管还没连上时暂存结果（最多 2 条，丢旧的）
 let currentWin = null
 const waiters = { ready: null, done: null } // {resolve, reject, win}
 
 const readyP = app.whenReady().then(() => {
   ready = true
   dbg('whenReady (resident helper up)')
-  armIdle()
+  registerHotkey()
+  connectHost()
+  startParentWatch()
+  // 冒烟测试钩子：模拟一次全局热键（无真实按键也可全链路验证 push→watch）
+  const testFire = Number(process.env.DSH_SCREENSHOT_TEST_FIRE_MS || 0)
+  if (testFire > 0) {
+    dbg(`TEST hook: firing hotkey in ${testFire}ms`)
+    setTimeout(onHotkey, testFire)
+  }
 }).catch((error) => {
   dbg(`whenReady failed: ${error && error.stack}`)
   respond({ ok: false, error: { message: String((error && error.message) || error) } })
@@ -90,12 +116,143 @@ const readyP = app.whenReady().then(() => {
 })
 
 function armIdle() {
+  // 全局热键模式：生命周期跟 DSH 走，不闲置自退（顺手清掉可能已挂上的定时器）
+  if (hotkeyActive) {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+    return
+  }
   if (idleTimer) clearTimeout(idleTimer)
   idleTimer = setTimeout(() => {
     dbg('idle 10min → exit')
     cleanupWindow()
     app.exit(0)
   }, IDLE_MS)
+}
+
+/**
+ * OS 级热键。globalShortcut.register 返回 false = 键被占（最常见：DSH 重启
+ * 窗口期旧孤儿 helper 还占着——它被父进程轮询 5s 内清退；也可能是别的应用）。
+ * 每 2s 重试直到成功，日志节流（第 1 次与每 15 次记一条）。
+ */
+function registerHotkey() {
+  let ok = false
+  try {
+    ok = globalShortcut.register(HOTKEY, onHotkey)
+  } catch (error) {
+    dbg(`hotkey register threw: ${error}`)
+  }
+  hotkeyTries += 1
+  if (ok) {
+    hotkeyActive = true
+    dbg(`hotkey registered: ${HOTKEY} (attempt ${hotkeyTries})`)
+    respond({ ok: true, value: { hotkey: HOTKEY } })
+    return
+  }
+  if (hotkeyTries === 1) {
+    respond({ ok: false, error: { message: `hotkey unavailable (another app owns ${HOTKEY}); retrying` } })
+  }
+  if (hotkeyTries === 1 || hotkeyTries % 15 === 0) {
+    dbg(`hotkey register failed (attempt ${hotkeyTries}): ${HOTKEY} — retry every ${HOTKEY_RETRY_MS}ms`)
+  }
+  setTimeout(registerHotkey, HOTKEY_RETRY_MS)
+}
+
+/** 父进程（DSH / 测试宿主）死了就退出释放热键，不留孤儿。 */
+function startParentWatch() {
+  setInterval(() => {
+    try {
+      process.kill(PARENT_PID, 0)
+    } catch (error) {
+      if (error && error.code === 'ESRCH') {
+        dbg(`parent pid=${PARENT_PID} gone → exit`)
+        cleanupWindow()
+        app.exit(0)
+      }
+      // EPERM = 存在但无权限，视为存活
+    }
+  }, PARENT_POLL_MS)
+}
+
+// ---------------------------------------------------------------------------
+// 热键结果推送：连入宿主的 \\.\pipe\dsh-screenshot-host，断线 2s 重连，
+// 连上即冲积压。宿主推送服务器没起（web/启动竞态）时结果在剪贴板，不算全丢。
+// ---------------------------------------------------------------------------
+function flushPushBuf() {
+  while (pushBuf.length > 0) {
+    if (!hostSock || hostSock.destroyed || !hostSock.writable) return
+    try {
+      hostSock.write(pushBuf.shift())
+    } catch {
+      return
+    }
+  }
+}
+
+function pushResult(message) {
+  const line = BRIDGE_PREFIX + JSON.stringify(message) + '\n'
+  if (hostSock && !hostSock.destroyed && hostSock.writable) {
+    try {
+      hostSock.write(line)
+      return
+    } catch {
+      // 落到缓冲
+    }
+  }
+  pushBuf.push(line)
+  if (pushBuf.length > 2) pushBuf.shift()
+  dbg('push buffered (host push pipe not connected yet)')
+}
+
+function connectHost() {
+  const sock = net.connect(HOST_PIPE)
+  sock.setEncoding('utf8')
+  let connected = false
+  const scheduleRetry = (why) => {
+    if (hostSock === sock) hostSock = null
+    if (!connected) {
+      connected = true
+      dbg(`host push connect failed (${why}); retry in 2s`)
+    }
+    if (!hostConnectTimer) {
+      hostConnectTimer = setTimeout(() => {
+        hostConnectTimer = null
+        connectHost()
+      }, 2000)
+    }
+  }
+  sock.on('connect', () => {
+    connected = true
+    hostSock = sock
+    dbg(`host push connected: ${HOST_PIPE}`)
+    flushPushBuf()
+  })
+  sock.on('error', (error) => { dbg(`host push error: ${error}`); scheduleRetry('error') })
+  sock.on('close', () => { scheduleRetry('close') })
+}
+
+/** 全局热键触发的 capture（与按钮 cap 共用 busy 单飞）。 */
+function onHotkey() {
+  armIdle()
+  if (busy) {
+    dbg('hotkey ignored (capture already in progress)')
+    return
+  }
+  busy = true
+  dbg('hotkey → capture')
+  readyP
+    .then(() => runCapture())
+    .then((value) => { pushResult({ ok: true, value }) })
+    .catch((error) => {
+      dbg(`hotkey capture error: ${error && error.stack}`)
+      pushResult({ ok: false, error: { message: String((error && error.message) || error) } })
+    })
+    .finally(() => {
+      busy = false
+      armIdle()
+    })
 }
 
 // ---------------------------------------------------------------------------
