@@ -13,7 +13,7 @@
  *   stdout = 只做启动公告与诊断：管道 listen 成功后发一行
  *     `dsh-screenshot-bridge:{"ok":true,"value":{"ready":true,"pipe":"\\\\.\\pipe\\..."}}`；
  *     Electron 还会先打一个空行，宿主忽略所有非 bridge 行。
- *   全局热键 = app ready 即 `globalShortcut.register(默认 Ctrl+Shift+A)`，OS 级
+ *   全局热键 = app ready 即 `globalShortcut.register(默认 Ctrl+Alt+X)`，OS 级
  *     捕获、绕开 DSH 全部输入闸门（设置面板/其他应用里也能截）；
  *     `DSH_SCREENSHOT_HOTKEY` 可换键；注册失败每 2s 重试（重启窗口期旧孤儿
  *     5s 内被父进程轮询清掉，或被别的应用占用）。
@@ -39,7 +39,7 @@ const BRIDGE_PREFIX = 'dsh-screenshot-bridge:'
 const IDLE_MS = 10 * 60 * 1000
 const JPEG_QUALITY = 92
 const DEBUG_LOG = require('node:path').join(require('node:os').tmpdir(), 'dsh-screenshot-debug.log')
-const HOTKEY = process.env.DSH_SCREENSHOT_HOTKEY || 'CommandOrControl+Shift+A'
+const HOTKEY = process.env.DSH_SCREENSHOT_HOTKEY || 'CommandOrControl+Alt+X'
 const HOST_PIPE = '\\\\.\\pipe\\dsh-screenshot-host'
 const PARENT_PID = process.ppid
 const PARENT_POLL_MS = 5 * 1000

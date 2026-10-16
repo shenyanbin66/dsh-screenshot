@@ -5,7 +5,7 @@ QQ 电脑端风格的截图插件（DeepSeek Harness 桌面版专用）。
 ## 功能
 
 - **触发**：
-  - **系统级全局热键 `Ctrl+Shift+A`**（OS 注册，任何界面都能按——包括 DSH
+  - **系统级全局热键 `Ctrl+Alt+X`**（OS 注册，任何界面都能按——包括 DSH
     设置面板、其他应用窗口；按下即进入选区，不看 DSH 聚不聚焦）
   - 或点 DSH 输入框左侧工具行的 📷 按钮（会话界面）
 - **选区**：冻结当前屏幕 → 拖拽矩形（带尺寸标签）→ 松开即确认
@@ -25,7 +25,7 @@ QQ 电脑端风格的截图插件（DeepSeek Harness 桌面版专用）。
 ## 架构
 
 ```
-globalShortcut('CommandOrControl+Shift+A')  ← OS 级注册，绕过 DSH 全部输入闸门
+globalShortcut('CommandOrControl+Alt+X')  ← OS 级注册，绕过 DSH 全部输入闸门
    │ 热键触发（或宿主管道 cap 命令，📸 按钮走 HTTP）
    ▼
 独立 Electron helper（runtime/electron-helper/）常驻服务：
@@ -42,8 +42,10 @@ globalShortcut('CommandOrControl+Shift+A')  ← OS 级注册，绕过 DSH 全部
 
 - **为什么全局热键**：DSH 设置面板打开时其输入管线（beforeInput/modal 层）
   会拦下所有可配置快捷键，DSH 内注册的快捷键在会话界面外完全无效，📷 按钮
-  也够不着——OS 级 `globalShortcut` 绕过 DSH 闸门。已核对 `@deepseek-ai`
-  全部默认键无 `Ctrl+Shift+A`（`KeyA` 保留规则带 shift 明确豁免，不冲突）。
+  也够不着——OS 级 `globalShortcut` 绕过 DSH 闸门。键位选 `Ctrl+Alt+X`：DSH
+  保留规则（`primary+KeyA` 无 shift、`primary+C/V/X/Z/Y/Q/H` 等）与全部已装
+  插件默认键均不占用；旧默认 `Ctrl+Shift+A` 因与用户环境里的「归档」快捷键
+  重合已弃用（全 asar 二进制扫描确认 DSH 自身无此绑定，冲突源在 DSH 之外）。
 - **为什么是命名管道**：Electron GUI 子进程启动 2ms 内就关闭 stdin 读端
   （最小对照探针实测），写 `cap` 永远送不到；stdout 也被 Electron 先打一个
   空行。故宿主→helper 命令走 `\\.\pipe\dsh-screenshot-<pid>`（stdout 只用来
@@ -84,7 +86,7 @@ globalShortcut('CommandOrControl+Shift+A')  ← OS 级注册，绕过 DSH 全部
 - 真实宿主链路（桩 ctx 驱动 `lib/index.js` 路由 handler）：fence → spawn →
   管道公告 → cap → PNG，`valueKeys=png,width,height`。
 - **全局热键 E2E**（桩 ctx + `DSH_SCREENSHOT_TEST_FIRE_MS=1500` 模拟热键）：
-  `hotkey registered: CommandOrControl+Shift+A (attempt 1)` → 1.5s 后 fire →
+  `hotkey registered: CommandOrControl+Alt+X (attempt 1)` → 1.5s 后 fire →
   capture ~1.2s → `watch: hotkey result delivered to live waiter` → 回包
   `{ok:true,value:{png,…}}` → disposer 清理，`E2E PASS`。
 
